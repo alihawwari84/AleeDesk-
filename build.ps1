@@ -5,6 +5,6 @@ New-Item -ItemType Directory -Force "$root\dist" | Out-Null
 $src = 'Protocol','Relay','Lan','Native','Ui','Host','Viewer','MainForm','Program' | ForEach-Object { "$root\src\$_.cs" }
 & $csc /nologo /target:winexe /optimize+ /main:RemoteDesk.Program /out:"$root\dist\ALeeDesk.exe" `
     /win32icon:"$root\assets\app.ico" "/resource:$root\assets\avatar.png,ALeeDesk.avatar.png" `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll @src
+    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Security.dll @src
 if ($LASTEXITCODE -ne 0) { throw 'ALeeDesk.exe build failed' }
 Write-Host "Built: $root\dist\ALeeDesk.exe"

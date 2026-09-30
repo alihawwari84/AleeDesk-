@@ -722,24 +722,65 @@ namespace RemoteDesk
     {
         readonly InputBox pwd;
 
-        public PasswordDialog(string formattedId) : base("Enter password", Theme.GLock, 196)
+        readonly Toggle remember;
+
+        public PasswordDialog(string formattedId) : base("Enter password", Theme.GLock, 226)
         {
             Body.Controls.Add(new Label { Text = "Connecting to remote desk", ForeColor = Theme.Muted, AutoSize = true, Location = new Point(24, 16) });
             Body.Controls.Add(new Label { Text = formattedId, Font = new Font("Segoe UI Semibold", 14f), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(22, 36) });
             pwd = new InputBox("Password shown on the other computer", 12f) { Location = new Point(24, 78), Size = new Size(390, 42) };
             pwd.Box.UseSystemPasswordChar = true;
             Body.Controls.Add(pwd);
-            Secondary("Cancel", 194, 138).Click += delegate { DialogResult = DialogResult.Cancel; };
-            Primary("Connect", Theme.GArrow, 304, 138).Click += delegate { Submit(); };
+            remember = new Toggle { Text = "Remember password for this desk", Location = new Point(24, 132), Size = new Size(390, 22) };
+            Body.Controls.Add(remember);
+            Secondary("Cancel", 194, 170).Click += delegate { DialogResult = DialogResult.Cancel; };
+            Primary("Connect", Theme.GArrow, 304, 170).Click += delegate { Submit(); };
             pwd.Box.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Submit(); } };
             Shown += delegate { pwd.Box.Focus(); };
         }
 
+        // Passwords are not case-sensitive (session passwords are shown in capitals and the
+        // unattended password is stored the same way).
         public string Password { get { return pwd.Value.Trim().ToUpperInvariant(); } }
+
+        public bool Remember { get { return remember.Checked; } }
 
         void Submit()
         {
             if (Password.Length == 0) { pwd.Flag(); return; }
+            DialogResult = DialogResult.OK;
+        }
+    }
+
+    // Sets the permanent password used for unattended access.
+    class SetPasswordDialog : BrandDialog
+    {
+        readonly InputBox first, second;
+        readonly Label error;
+
+        public SetPasswordDialog() : base("Unattended access password", Theme.GLock, 270)
+        {
+            Body.Controls.Add(new Label { Text = "Anyone with this password can connect without anyone accepting. Use at least 8 characters.", ForeColor = Theme.Muted, Location = new Point(24, 12), Size = new Size(392, 52) });
+            first = new InputBox("New password", 11.5f) { Location = new Point(24, 68), Size = new Size(390, 40) };
+            second = new InputBox("Type it again", 11.5f) { Location = new Point(24, 116), Size = new Size(390, 40) };
+            first.Box.UseSystemPasswordChar = true;
+            second.Box.UseSystemPasswordChar = true;
+            Body.Controls.Add(first);
+            Body.Controls.Add(second);
+            error = new Label { ForeColor = Theme.Red, Location = new Point(24, 164), Size = new Size(392, 36) };
+            Body.Controls.Add(error);
+            Secondary("Cancel", 194, 210).Click += delegate { DialogResult = DialogResult.Cancel; };
+            Primary("Save", Theme.GCheck, 304, 210).Click += delegate { Submit(); };
+            second.Box.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Submit(); } };
+            Shown += delegate { first.Box.Focus(); };
+        }
+
+        public string Password { get { return first.Value.Trim().ToUpperInvariant(); } }
+
+        void Submit()
+        {
+            if (first.Value.Trim().Length < 8) { error.Text = "Use at least 8 characters."; first.Flag(); return; }
+            if (first.Value != second.Value) { error.Text = "The two passwords don't match."; second.Flag(); return; }
             DialogResult = DialogResult.OK;
         }
     }

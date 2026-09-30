@@ -18,15 +18,27 @@ namespace RemoteDesk
             Application.SetCompatibleTextRenderingDefault(false);
             if (args.Length > 0 && args[0] == "--viewtest") { ViewTest(args.Length > 1 ? args[1] : "127.0.0.1:7788"); return; }
             if (args.Length > 0 && args[0] == "--uishot") { UiShot(args.Length > 1 ? args[1] : "."); return; }
+            bool background = args.Length > 0 && args[0] == "--background"; // started with Windows
             bool first;
             using (Mutex single = new Mutex(true, "RemoteDesk.SingleInstance", out first))
+            using (EventWaitHandle showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "RemoteDesk.Show"))
             {
                 if (!first)
                 {
-                    MessageBox.Show(Brand.Name + " is already running on this computer.\n\nTwo copies would share the same ID.", Brand.Name);
+                    // Already running (maybe hidden in the tray): open that window instead. Only
+                    // one copy may run because the desk ID belongs to the computer.
+                    if (!background) showSignal.Set();
                     return;
                 }
-                Application.Run(new MainForm());
+                MainForm form = new MainForm(background);
+                Thread waiter = new Thread(delegate()
+                {
+                    while (showSignal.WaitOne())
+                        try { form.BeginInvoke(new MethodInvoker(form.ShowFromTray)); } catch { }
+                });
+                waiter.IsBackground = true;
+                waiter.Start();
+                Application.Run(form);
             }
         }
 
@@ -96,8 +108,8 @@ namespace RemoteDesk
             }
             m.Close();
 
-            Form[] forms = { new PasswordDialog("626 941 456"), new ConsentDialog("86.108.23.52") };
-            string[] names = { "ui-password.png", "ui-consent.png" };
+            Form[] forms = { new PasswordDialog("626 941 456"), new ConsentDialog("86.108.23.52"), new SetPasswordDialog() };
+            string[] names = { "ui-password.png", "ui-consent.png", "ui-setpassword.png" };
             for (int i = 0; i < forms.Length; i++)
             {
                 Form f = forms[i];
@@ -112,6 +124,32 @@ namespace RemoteDesk
                 }
                 f.Close();
             }
+        }
+
+        // Connects once and returns "connected" or the error text; retries while the host is
+        // still re-registering with the relay after the previous session.
+        static string TryConnect(string server, string id, string password, StringBuilder log)
+        {
+            string result = "timeout";
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                Channel ch = null;
+                string err = null;
+                ManualResetEvent done = new ManualResetEvent(false);
+                Connector.Start(server, id, password, delegate { }, delegate(Channel c) { ch = c; done.Set(); }, delegate(string e) { err = e; done.Set(); });
+                if (!done.WaitOne(20000)) return "timeout";
+                if (ch != null)
+                {
+                    ch.Send('X', null);
+                    ch.Close();
+                    Thread.Sleep(1500);
+                    return "connected";
+                }
+                result = err;
+                if (err == null || !err.Contains("not found")) return result;
+                Thread.Sleep(1000);
+            }
+            return result;
         }
 
         // Headless end-to-end check: host + viewer in one process through the relay.
@@ -180,7 +218,7 @@ namespace RemoteDesk
                 channel.Send('Z', Proto.Ints(fileId));
                 string expectedPath = Path.Combine(saveDir, fileName);
                 bool fileOk = false;
-                DateTime fend = DateTime.UtcNow.AddSeconds(5);
+                DateTime fend = DateTime.UtcNow.AddSeconds(30); // generous: the relay can be slow at times
                 while (DateTime.UtcNow < fend)
                 {
                     if (File.Exists(expectedPath))
@@ -234,8 +272,19 @@ namespace RemoteDesk
                 Lan.Stop();
                 log.AppendLine("direct connection (no relay): " + (directOk ? "OK, screen received" : "FAILED"));
 
+                // unattended access: the permanent password gets in with nobody there to accept,
+                // while the session password still needs someone to click Accept.
+                host.RequireConsent = true;
+                host.Consent = delegate { return false; }; // nobody at the computer
+                host.UnattendedKey = Proto.DeriveKey("TESTPASS99", host.Id);
+                bool unattendedOk = TryConnect(server, host.Id, "TESTPASS99", log) == "connected";
+                string attended = TryConnect(server, host.Id, host.Password, log);
+                bool consentOk = attended.Contains("declined");
+                log.AppendLine("unattended password without anyone accepting: " + (unattendedOk ? "OK, connected" : "FAILED"));
+                log.AppendLine("session password with nobody accepting: " + (consentOk ? "OK, declined as expected" : "FAILED (" + attended + ")"));
+
                 host.Stop();
-                log.AppendLine(rects > 0 && fileOk && lanOk && directOk ? "SELFTEST PASS" : "SELFTEST FAIL");
+                log.AppendLine(rects > 0 && fileOk && lanOk && directOk && unattendedOk && consentOk ? "SELFTEST PASS" : "SELFTEST FAIL");
             }
             catch (Exception ex) { log.AppendLine("SELFTEST FAIL: " + ex); }
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest.txt"), log.ToString());

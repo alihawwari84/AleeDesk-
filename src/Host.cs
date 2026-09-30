@@ -23,6 +23,8 @@ namespace RemoteDesk
         class Session
         {
             public TcpClient Client;
+            public Channel Ch;
+            public bool Unattended; // signed in with the permanent password
             public volatile bool Active = true;
             public volatile int Quality = 60;
             public volatile int Scale = 100;
@@ -57,6 +59,27 @@ namespace RemoteDesk
         volatile Session session;
 
         public string Password { get { lock (pwLock) return password; } }
+
+        // Key derived from the permanent unattended-access password (null = unattended off).
+        public volatile byte[] UnattendedKey;
+
+        // Too many wrong passwords in a short time locks everyone out for a while, so a
+        // permanent password can't be guessed by trying many times.
+        readonly Queue<DateTime> failures = new Queue<DateTime>();
+
+        void RecordFailure()
+        {
+            lock (failures) failures.Enqueue(DateTime.UtcNow);
+        }
+
+        bool LockedOut()
+        {
+            lock (failures)
+            {
+                while (failures.Count > 0 && (DateTime.UtcNow - failures.Peek()).TotalMinutes > 10) failures.Dequeue();
+                return failures.Count >= 10;
+            }
+        }
 
         public void NewPassword()
         {
@@ -123,6 +146,16 @@ namespace RemoteDesk
 
         void SetStatus(string s) { if (Status != null) Status(s); }
 
+        // The relay connection's own state, shown again whenever a session ends (a direct
+        // network session doesn't go through the relay loop, so it wouldn't refresh it).
+        volatile string relayStatus = "Starting...";
+
+        void SetRelayStatus(string s)
+        {
+            relayStatus = s;
+            if (session == null) SetStatus(s);
+        }
+
         static void ParseServer(string server, out string host, out int port)
         {
             server = server.Trim();
@@ -140,7 +173,7 @@ namespace RemoteDesk
                 int delayMs = 2500;
                 try
                 {
-                    SetStatus("Connecting to relay...");
+                    SetRelayStatus("Connecting to relay...");
                     string host; int port;
                     ParseServer(Server, out host, out port);
                     c = new TcpClient();
@@ -159,7 +192,7 @@ namespace RemoteDesk
                     byte t = ch.Recv(out d);
                     if (t != 'O') throw new Exception(t == 'E' ? Proto.Str(d) : "unexpected reply");
                     s.ReadTimeout = Timeout.Infinite;
-                    SetStatus("Ready - waiting for connections");
+                    SetRelayStatus("Ready - waiting for connections");
                     while (true)
                     {
                         t = ch.Recv(out d);
@@ -172,7 +205,7 @@ namespace RemoteDesk
                 }
                 catch (Exception ex)
                 {
-                    if (run && gen == my) SetStatus("Offline: " + ex.Message);
+                    if (run && gen == my) SetRelayStatus("Offline: " + ex.Message);
                 }
                 finally
                 {
@@ -193,11 +226,16 @@ namespace RemoteDesk
             if (t != 'A' || d.Length != 48) return;
             byte[] nV = Proto.Sub(d, 0, 16);
             byte[] proof = Proto.Sub(d, 16, 32);
-            byte[] key;
-            lock (pwLock) key = pwKey;
-
-            if (!Proto.Eq(Proto.Hmac(key, Proto.Text("auth"), nH, nV), proof))
+            // Either the one-time session password (someone must accept) or the permanent
+            // unattended password (no one needs to be there).
+            byte[] attended, unattended = UnattendedKey, key = null;
+            lock (pwLock) attended = pwKey;
+            bool viaUnattended = false, locked = LockedOut();
+            if (!locked && Proto.Eq(Proto.Hmac(attended, Proto.Text("auth"), nH, nV), proof)) key = attended;
+            else if (!locked && unattended != null && Proto.Eq(Proto.Hmac(unattended, Proto.Text("auth"), nH, nV), proof)) { key = unattended; viaUnattended = true; }
+            if (key == null)
             {
+                RecordFailure();
                 ch.Send('F', null);
                 Thread.Sleep(1500);
                 if (++failCount >= 5) { failCount = 0; NewPassword(); }
@@ -209,7 +247,7 @@ namespace RemoteDesk
             s.ReadTimeout = Timeout.Infinite;
             ch.Send('W', null);
 
-            if (session != null || (RequireConsent && (Consent == null || !Consent(viewerIp))))
+            if (session != null || (!viaUnattended && RequireConsent && (Consent == null || !Consent(viewerIp))))
             {
                 ch.Send('D', null); // declined, or already in a session with someone else
                 return;
@@ -218,6 +256,8 @@ namespace RemoteDesk
             Rectangle scr = Screen.PrimaryScreen.Bounds;
             Session sess = new Session();
             sess.Client = client;
+            sess.Ch = ch;
+            sess.Unattended = viaUnattended;
             session = sess;
             ch.Send('G', null);
             if (SessionChanged != null) SessionChanged(true, viewerIp);
@@ -226,7 +266,12 @@ namespace RemoteDesk
             Thread cap = new Thread(delegate()
             {
                 try { CaptureLoop(ch, sess, scr); }
-                catch (Exception ex) { SetStatus("Capture error: " + ex.Message); }
+                catch (Exception ex)
+                {
+                    // the connection closing at the end of a session is normal, not an error
+                    bool connectionEnded = ex is IOException || ex is ObjectDisposedException || ex is SocketException;
+                    if (sess.Active && !connectionEnded) SetStatus("Capture error: " + ex.Message);
+                }
                 sess.Active = false;
                 try { client.Close(); } catch { }
             });
@@ -251,6 +296,7 @@ namespace RemoteDesk
                     sess.Files.Clear();
                 }
                 session = null;
+                SetStatus(relayStatus);
                 if (SessionChanged != null) SessionChanged(false, viewerIp);
             }
         }

@@ -50,6 +50,55 @@ namespace RemoteDesk
         public int Seconds;
     }
 
+    // Secrets in settings.ini are encrypted with Windows DPAPI, so only this Windows user on
+    // this computer can read them back.
+    static class Secret
+    {
+        static readonly byte[] Entropy = System.Text.Encoding.UTF8.GetBytes("AleeDesk");
+
+        public static string Protect(byte[] data)
+        {
+            return Convert.ToBase64String(System.Security.Cryptography.ProtectedData.Protect(data, Entropy, System.Security.Cryptography.DataProtectionScope.CurrentUser));
+        }
+
+        public static byte[] Unprotect(string text)
+        {
+            try { return System.Security.Cryptography.ProtectedData.Unprotect(Convert.FromBase64String(text), Entropy, System.Security.Cryptography.DataProtectionScope.CurrentUser); }
+            catch { return null; }
+        }
+    }
+
+    // "Start with Windows": a per-user Run entry that launches AleeDesk in the tray.
+    static class Autostart
+    {
+        const string Key = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+        static string Command { get { return "\"" + Application.ExecutablePath + "\" --background"; } }
+
+        public static bool Enabled
+        {
+            get
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(Key))
+                    return k != null && k.GetValue(Brand.Name) != null;
+            }
+            set
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Key))
+                {
+                    if (value) k.SetValue(Brand.Name, Command);
+                    else if (k.GetValue(Brand.Name) != null) k.DeleteValue(Brand.Name);
+                }
+            }
+        }
+
+        // Keep the entry pointing at this exe if it was moved.
+        public static void Refresh()
+        {
+            try { if (Enabled) Enabled = true; } catch { }
+        }
+    }
+
     public class Settings
     {
         public string Id;
@@ -57,6 +106,9 @@ namespace RemoteDesk
         public bool Consent = true;
         public bool RunRelay;
         public bool Discoverable = true;
+        public bool Unattended;
+        public byte[] UnattendedKey; // derived from the permanent password, never the password itself
+        public Dictionary<string, string> Saved = new Dictionary<string, string>(); // desk id -> remembered password
         public List<KeyValuePair<string, DateTime>> Recent = new List<KeyValuePair<string, DateTime>>();
         public List<Contact> Contacts = new List<Contact>();
         public List<HistoryItem> History = new List<HistoryItem>();
@@ -87,6 +139,9 @@ namespace RemoteDesk
                     else if (k == "consent") s.Consent = v != "0";
                     else if (k == "relay") s.RunRelay = v == "1";
                     else if (k == "lan") s.Discoverable = v != "0";
+                    else if (k == "unattended") s.Unattended = v == "1";
+                    else if (k == "ukey") s.UnattendedKey = Secret.Unprotect(v);
+                    else if (k == "saved") s.ParseSaved(v);
                     else if (k == "recent") s.ParseRecent(v);
                     else if (k == "contacts") s.ParseContacts(v);
                     else if (k == "history") s.ParseHistory(v);
@@ -151,6 +206,17 @@ namespace RemoteDesk
             if (Recent.Count > 9) Recent.RemoveRange(9, Recent.Count - 9);
         }
 
+        void ParseSaved(string v)
+        {
+            foreach (string part in v.Split(';'))
+            {
+                string[] kv = part.Split(':');
+                if (kv.Length != 2) continue;
+                byte[] pwd = Secret.Unprotect(kv[1]);
+                if (pwd != null) Saved[kv[0]] = System.Text.Encoding.UTF8.GetString(pwd);
+            }
+        }
+
         public void AddHistory(bool incoming, string who, DateTime start)
         {
             History.Insert(0, new HistoryItem { Incoming = incoming, Who = who, Start = start, Seconds = (int)(DateTime.UtcNow - start).TotalSeconds });
@@ -163,10 +229,13 @@ namespace RemoteDesk
             foreach (KeyValuePair<string, DateTime> r in Recent) rec.Add(r.Key + ":" + r.Value.Ticks);
             foreach (Contact c in Contacts) con.Add(Uri.EscapeDataString(c.Name) + "|" + c.Id);
             foreach (HistoryItem h in History) his.Add((h.Incoming ? "in" : "out") + "|" + Uri.EscapeDataString(h.Who) + "|" + h.Start.Ticks + "|" + h.Seconds);
+            List<string> sav = new List<string>();
+            foreach (KeyValuePair<string, string> p in Saved) sav.Add(p.Key + ":" + Secret.Protect(System.Text.Encoding.UTF8.GetBytes(p.Value)));
             try
             {
                 File.WriteAllLines(FilePath, new string[] {
                     "id=" + Id, "server=" + Server, "consent=" + (Consent ? "1" : "0"), "relay=" + (RunRelay ? "1" : "0"), "lan=" + (Discoverable ? "1" : "0"),
+                    "unattended=" + (Unattended ? "1" : "0"), "ukey=" + (UnattendedKey != null ? Secret.Protect(UnattendedKey) : ""), "saved=" + string.Join(";", sav),
                     "recent=" + string.Join(";", rec), "contacts=" + string.Join(";", con), "history=" + string.Join(";", his)
                 });
             }
@@ -211,8 +280,18 @@ namespace RemoteDesk
         string resultTitle, resultText;
         bool resultError;
 
-        public MainForm()
+        NotifyIcon tray;
+        bool quitting, startHidden, trayHintShown;
+        Toggle tglUnattended, tglAutostart;
+        FlatButton btnUnattendedPwd;
+        Label lblUnattended;
+
+        public MainForm() : this(false) { }
+
+        // startHidden: launched with Windows - stay in the tray until opened.
+        public MainForm(bool startHidden)
         {
+            this.startHidden = startHidden;
             Text = Brand.Name;
             Icon = Brand.Icon;
             AutoScaleDimensions = new SizeF(96f, 96f);
@@ -252,8 +331,63 @@ namespace RemoteDesk
             WireHost();
             ShowPage(0);
             RefreshHero();
-            FormClosing += delegate { host.Stop(); RelayServer.Stop(); Lan.Stop(); };
+            BuildTray();
+            FormClosing += OnClosing;
             Shown += delegate { RebuildDevices(); RebuildContacts(); RebuildSessions(); SetStatus(lastStatus); idInput.Box.Focus(); };
+        }
+
+        // ---- tray -----------------------------------------------------------------------
+
+        void BuildTray()
+        {
+            tray = new NotifyIcon { Icon = Brand.Icon, Text = Brand.Name + " - desk " + Theme.FormatId(cfg.Id), Visible = true };
+            ContextMenuStrip m = new ContextMenuStrip();
+            m.Items.Add("Open " + Brand.Name, null, delegate { ShowFromTray(); });
+            m.Items.Add(new ToolStripSeparator());
+            m.Items.Add("Quit", null, delegate { quitting = true; Close(); });
+            tray.ContextMenuStrip = m;
+            tray.DoubleClick += delegate { ShowFromTray(); };
+        }
+
+        internal void ShowFromTray()
+        {
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        // While this desk must stay reachable (unattended access or start with Windows), the
+        // close button only hides the window; Quit in the tray menu really exits.
+        void OnClosing(object sender, FormClosingEventArgs e)
+        {
+            bool stayReachable = cfg.Unattended || tglAutostart.Checked;
+            if (!quitting && e.CloseReason == CloseReason.UserClosing && stayReachable)
+            {
+                e.Cancel = true;
+                Hide();
+                if (!trayHintShown)
+                {
+                    trayHintShown = true;
+                    tray.ShowBalloonTip(5000, Brand.Name + " is still running", "This desk can still be reached. Right-click the icon here to quit.", ToolTipIcon.Info);
+                }
+                return;
+            }
+            host.Stop();
+            RelayServer.Stop();
+            Lan.Stop();
+            tray.Visible = false;
+            tray.Dispose();
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startHidden)
+            {
+                startHidden = false;
+                if (!IsHandleCreated) CreateHandle();
+                value = false;
+            }
+            base.SetVisibleCore(value);
         }
 
         // ---- sidebar and pages ----------------------------------------------------------
@@ -436,13 +570,64 @@ namespace RemoteDesk
             sec.Controls.Add(tglLan);
             p.Controls.Add(sec);
 
-            RoundedPanel about = Card(0, 328, 738, 110);
-            about.Controls.Add(new MarkLogo { Location = new Point(24, 30), Size = new Size(48, 48) });
-            about.Controls.Add(new Label { Text = Brand.Name, Font = new Font("Segoe UI", 14f, FontStyle.Bold), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(86, 24) });
-            about.Controls.Add(new TwoTone { A = "Less waiting.", B = "More fixing.", Location = new Point(91, 60), Size = new Size(260, 24) });
-            about.Controls.Add(new Label { Text = "Version " + Brand.Version, ForeColor = Theme.Muted, AutoSize = true, Location = new Point(620, 44) });
+            RoundedPanel una = Card(0, 328, 738, 140);
+            una.Controls.Add(new GlyphBadge { Glyph = Theme.GLock, Location = new Point(22, 16), Size = new Size(32, 32) });
+            una.Controls.Add(new Label { Text = "Unattended access", Font = new Font("Segoe UI Semibold", 11.5f), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(64, 19) });
+            tglUnattended = new Toggle { Text = "Allow access with a permanent password - no one needs to accept", Checked = cfg.Unattended && cfg.UnattendedKey != null, Location = new Point(24, 62), Size = new Size(520, 24) };
+            tglUnattended.CheckedChanged += delegate
+            {
+                if (tglUnattended.Checked && cfg.UnattendedKey == null && !AskUnattendedPassword()) { tglUnattended.Checked = false; return; }
+                cfg.Unattended = tglUnattended.Checked;
+                cfg.Save();
+                ApplyUnattended();
+                if (cfg.Unattended && !tglAutostart.Checked) tglAutostart.Checked = true; // needed to be reachable after a restart
+            };
+            una.Controls.Add(tglUnattended);
+            bool autostartOn = false;
+            try { autostartOn = Autostart.Enabled; } catch { }
+            tglAutostart = new Toggle { Text = "Start " + Brand.Name + " with Windows", Checked = autostartOn, Location = new Point(24, 98), Size = new Size(520, 24) };
+            tglAutostart.CheckedChanged += delegate
+            {
+                try { Autostart.Enabled = tglAutostart.Checked; }
+                catch (Exception ex) { MessageBox.Show(this, "Couldn't change this setting: " + ex.Message, Brand.Name); }
+            };
+            una.Controls.Add(tglAutostart);
+            btnUnattendedPwd = FlatButton.Ghost("Set password", Theme.GLock);
+            btnUnattendedPwd.SetBounds(560, 56, 156, 38);
+            btnUnattendedPwd.Click += delegate { AskUnattendedPassword(); };
+            una.Controls.Add(btnUnattendedPwd);
+            lblUnattended = new Label { Location = new Point(560, 100), Size = new Size(156, 22), ForeColor = Theme.Muted, Font = new Font("Segoe UI", 8.5f), TextAlign = ContentAlignment.MiddleCenter };
+            una.Controls.Add(lblUnattended);
+            p.Controls.Add(una);
+
+            RoundedPanel about = Card(0, 484, 738, 72);
+            about.Controls.Add(new MarkLogo { Location = new Point(24, 18), Size = new Size(36, 36) });
+            about.Controls.Add(new Label { Text = Brand.Name, Font = new Font("Segoe UI", 12f, FontStyle.Bold), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(72, 22) });
+            about.Controls.Add(new TwoTone { A = "Less waiting.", B = "More fixing.", Location = new Point(180, 24), Size = new Size(260, 24) });
+            about.Controls.Add(new Label { Text = "Version " + Brand.Version, ForeColor = Theme.Muted, AutoSize = true, Location = new Point(620, 27) });
             p.Controls.Add(about);
             return p;
+        }
+
+        bool AskUnattendedPassword()
+        {
+            using (SetPasswordDialog d = new SetPasswordDialog())
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return false;
+                cfg.UnattendedKey = Proto.DeriveKey(d.Password, cfg.Id);
+            }
+            cfg.Save();
+            ApplyUnattended();
+            Flash(btnUnattendedPwd);
+            return true;
+        }
+
+        void ApplyUnattended()
+        {
+            host.UnattendedKey = cfg.Unattended ? cfg.UnattendedKey : null;
+            btnUnattendedPwd.Text = cfg.UnattendedKey != null ? "Change password" : "Set password";
+            lblUnattended.ForeColor = cfg.Unattended && cfg.UnattendedKey != null ? Theme.Green : Theme.Muted;
+            lblUnattended.Text = cfg.UnattendedKey == null ? "No password set yet" : cfg.Unattended ? "On - password set" : "Password set (off)";
         }
 
         // Lists are rebuilt after the window has been DPI-scaled, so size rows from the
@@ -512,6 +697,8 @@ namespace RemoteDesk
                 ContextMenuStrip menu = new ContextMenuStrip();
                 menu.Items.Add("Connect", null, delegate { StartConnect(id); });
                 menu.Items.Add("Add to contacts", null, delegate { ShowPage(2); contactId.Value = Theme.FormatId(id); contactName.Box.Focus(); });
+                if (cfg.Saved.ContainsKey(id))
+                    menu.Items.Add("Forget saved password", null, delegate { cfg.Saved.Remove(id); cfg.Save(); });
                 menu.Items.Add("Remove", null, delegate
                 {
                     cfg.Recent.RemoveAll(delegate(KeyValuePair<string, DateTime> x) { return x.Key == id; });
@@ -654,6 +841,8 @@ namespace RemoteDesk
             host.Start();
             Lan.Discoverable = cfg.Discoverable;
             Lan.Start(cfg.Id, host.AcceptDirect);
+            ApplyUnattended();
+            Autostart.Refresh();
             tglRelay.CheckedChanged += delegate
             {
                 cfg.RunRelay = tglRelay.Checked;
@@ -804,11 +993,14 @@ namespace RemoteDesk
             }
             string fid = Theme.FormatId(id), pwd;
             idInput.Value = fid;
-            using (PasswordDialog d = new PasswordDialog(fid))
-            {
-                if (d.ShowDialog(this) != DialogResult.OK) return;
-                pwd = d.Password;
-            }
+            bool remember = false, usedSaved = cfg.Saved.TryGetValue(id, out pwd);
+            if (!usedSaved)
+                using (PasswordDialog d = new PasswordDialog(fid))
+                {
+                    if (d.ShowDialog(this) != DialogResult.OK) return;
+                    pwd = d.Password;
+                    remember = d.Remember;
+                }
 
             btnConnect.Enabled = false;
             resultTitle = null;
@@ -838,9 +1030,10 @@ namespace RemoteDesk
                             {
                                 EndConnect();
                                 cfg.AddRecent(id);
+                                if (remember) cfg.Saved[id] = pwd;
                                 cfg.Save();
                                 RebuildDevices();
-                                OpenViewer(ch, id, direct);
+                                OpenViewer(ch, id, direct, pwd);
                             });
                         },
                         delegate(string err)
@@ -849,6 +1042,12 @@ namespace RemoteDesk
                             {
                                 EndConnect();
                                 if (err == "Cancelled") SetResult(false, "Connection cancelled", "No connection was made.");
+                                else if (usedSaved && err == "Wrong password")
+                                {
+                                    cfg.Saved.Remove(id);
+                                    cfg.Save();
+                                    SetResult(true, "Saved password no longer works", "The password for " + fid + " has changed. Connect again and enter the new one.");
+                                }
                                 else SetResult(true, "Couldn't connect", err);
                             });
                         });
@@ -858,7 +1057,7 @@ namespace RemoteDesk
             route.Start();
         }
 
-        void OpenViewer(Channel ch, string id, bool direct)
+        void OpenViewer(Channel ch, string id, bool direct, string pwd)
         {
             string fid = Theme.FormatId(id);
             DateTime start = DateTime.UtcNow;
