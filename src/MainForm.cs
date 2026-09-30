@@ -10,7 +10,7 @@ namespace RemoteDesk
     public static class Brand
     {
         public const string Name = "AleeDesk";
-        public const string Version = "1.1";
+        public const string Version = "1.2";
 
         // Built-in relay server, so a fresh install connects without any setup.
         public const string DefaultRelay = "5.189.191.129:7788";
