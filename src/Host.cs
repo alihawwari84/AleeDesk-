@@ -95,6 +95,32 @@ namespace RemoteDesk
             if (s != null) { s.Active = false; try { s.Client.Close(); } catch { } }
         }
 
+        // A viewer on the same network connecting straight to us (see Lan.cs). It opens like a
+        // relay pairing ('V'+our id -> 'O'), then runs the normal password check and session.
+        public void AcceptDirect(TcpClient c)
+        {
+            Thread t = new Thread(delegate()
+            {
+                try
+                {
+                    c.NoDelay = true;
+                    NetworkStream s = c.GetStream();
+                    s.ReadTimeout = 10000;
+                    Channel ch = new Channel(s);
+                    ch.MaxLen = 128;
+                    byte[] d;
+                    if (ch.Recv(out d) != 'V' || Proto.Str(d) != Id) { ch.Send('E', Proto.Text("Remote ID not found on this network")); return; }
+                    ch.MaxLen = Proto.MaxFrame;
+                    ch.Send('O', null);
+                    RunSession(ch, c, ((System.Net.IPEndPoint)c.Client.RemoteEndPoint).Address.ToString() + " (local network)");
+                }
+                catch { }
+                finally { try { c.Close(); } catch { } }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
         void SetStatus(string s) { if (Status != null) Status(s); }
 
         static void ParseServer(string server, out string host, out int port)
@@ -183,9 +209,9 @@ namespace RemoteDesk
             s.ReadTimeout = Timeout.Infinite;
             ch.Send('W', null);
 
-            if (RequireConsent && (Consent == null || !Consent(viewerIp)))
+            if (session != null || (RequireConsent && (Consent == null || !Consent(viewerIp))))
             {
-                ch.Send('D', null);
+                ch.Send('D', null); // declined, or already in a session with someone else
                 return;
             }
 

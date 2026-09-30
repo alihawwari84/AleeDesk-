@@ -197,8 +197,45 @@ namespace RemoteDesk
 
                 channel.Send('X', null);
                 channel.Close();
+                Thread.Sleep(1500); // let the host finish that session
+
+                // local network: discovery answer, then a direct connection that skips the relay
+                bool lanOk = false, directOk = false;
+                Lan.Start(host.Id, host.AcceptDirect);
+                using (System.Net.Sockets.UdpClient q = new System.Net.Sockets.UdpClient(0))
+                {
+                    q.Client.ReceiveTimeout = 3000;
+                    byte[] ask = Encoding.ASCII.GetBytes("ALDQ");
+                    q.Send(ask, ask.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, Lan.DiscoveryPort));
+                    System.Net.IPEndPoint from = null;
+                    try
+                    {
+                        string reply = Encoding.UTF8.GetString(q.Receive(ref from));
+                        lanOk = reply.StartsWith("ALDA|" + host.Id + "|");
+                        log.AppendLine("lan discovery reply: " + reply);
+                    }
+                    catch (Exception ex) { log.AppendLine("lan discovery: no reply (" + ex.Message + ")"); }
+                }
+                Channel direct = null;
+                ManualResetEvent done3 = new ManualResetEvent(false);
+                Connector.Start("127.0.0.1:" + Lan.DirectPort, host.Id, host.Password, delegate { }, delegate(Channel c) { direct = c; done3.Set(); },
+                    delegate(string e) { log.AppendLine("direct connect failed: " + e); done3.Set(); });
+                if (done3.WaitOne(15000) && direct != null)
+                {
+                    DateTime dend = DateTime.UtcNow.AddSeconds(5);
+                    while (DateTime.UtcNow < dend && !directOk)
+                    {
+                        byte[] d;
+                        if (direct.Recv(out d) == 'R') directOk = true;
+                    }
+                    direct.Send('X', null);
+                    direct.Close();
+                }
+                Lan.Stop();
+                log.AppendLine("direct connection (no relay): " + (directOk ? "OK, screen received" : "FAILED"));
+
                 host.Stop();
-                log.AppendLine(rects > 0 && fileOk ? "SELFTEST PASS" : "SELFTEST FAIL");
+                log.AppendLine(rects > 0 && fileOk && lanOk && directOk ? "SELFTEST PASS" : "SELFTEST FAIL");
             }
             catch (Exception ex) { log.AppendLine("SELFTEST FAIL: " + ex); }
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest.txt"), log.ToString());

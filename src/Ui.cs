@@ -475,7 +475,7 @@ namespace RemoteDesk
             int sy = (int)(104 * k), sh = (int)(18 * k);
             TextRenderer.DrawText(g, Theme.GMonitor, StatGlyph, new Rectangle(tx, sy, (int)(30 * k), 2 * sh), Theme.Text, Theme.Line);
             TextRenderer.DrawText(g, devTitle, StatFont, new Rectangle(tx + (int)(36 * k), sy, (int)(170 * k), sh), Theme.Ink, Theme.Line);
-            TextRenderer.DrawText(g, devSub, StatSub, new Rectangle(tx + (int)(36 * k), sy + sh, (int)(170 * k), sh), devSub == "Online" ? Theme.Green : Theme.Muted, Theme.Line);
+            TextRenderer.DrawText(g, devSub, StatSub, new Rectangle(tx + (int)(36 * k), sy + sh, (int)(170 * k), sh), devSub.StartsWith("Online") ? Theme.Green : Theme.Muted, Theme.Line);
             int dx = tx + (int)(222 * k);
             using (Pen p = new Pen(Theme.Border)) g.DrawLine(p, dx, sy + 2, dx, sy + 2 * sh - 2);
             TextRenderer.DrawText(g, Theme.GClock, StatGlyph, new Rectangle(dx + (int)(22 * k), sy, (int)(30 * k), 2 * sh), Theme.Text, Theme.Line);
@@ -506,20 +506,22 @@ namespace RemoteDesk
         }
     }
 
-    // A device you connected to before: blue band with a monitor icon, then the ID and when.
-    class RecentTile : RoundedPanel
+    // A device card: blue band with a monitor icon (plus a green dot when it's on this
+    // network), then a title and a small line under it.
+    class DeviceTile : RoundedPanel
     {
-        readonly string id;
-        readonly DateTime when;
+        readonly string title, sub;
+        readonly bool online;
         bool hover;
         static readonly Font GlyphFont = new Font(Theme.IconFont, 22f);
         static readonly Font IdFont = new Font("Segoe UI Semibold", 12f);
         static readonly Font SmallFont = new Font("Segoe UI", 8.5f);
 
-        public RecentTile(string id, DateTime when)
+        public DeviceTile(string title, string sub, bool online)
         {
-            this.id = id;
-            this.when = when;
+            this.title = title;
+            this.sub = sub;
+            this.online = online;
             BackColor = Theme.Card;
             Radius = 14;
             Cursor = Cursors.Hand;
@@ -541,9 +543,16 @@ namespace RemoteDesk
                 using (Pen pen = new Pen(hover ? Theme.Primary : Theme.Border, hover ? 2f : 1f)) g.DrawPath(pen, p);
             }
             TextRenderer.DrawText(g, Theme.GMonitor, GlyphFont, new Rectangle(0, 0, Width, band), Theme.Primary, Theme.Centered);
+            if (online)
+            {
+                float d = band * 0.18f;
+                RectangleF dot = new RectangleF(Width / 2f + band * 0.2f, band * 0.26f, d, d);
+                using (SolidBrush b = new SolidBrush(Theme.PrimarySoft)) g.FillEllipse(b, RectangleF.Inflate(dot, 2, 2));
+                using (SolidBrush b = new SolidBrush(Theme.Green)) g.FillEllipse(b, dot);
+            }
             int rest = Height - band, pad = (int)(Width * 0.07f);
-            TextRenderer.DrawText(g, Theme.FormatId(id), IdFont, new Rectangle(pad, band + (int)(rest * 0.12f), Width - 2 * pad, (int)(rest * 0.44f)), Theme.Ink, Theme.Line);
-            TextRenderer.DrawText(g, "Connected " + Theme.Ago(when), SmallFont, new Rectangle(pad, band + (int)(rest * 0.56f), Width - 2 * pad, (int)(rest * 0.32f)), Theme.Muted, Theme.Line);
+            TextRenderer.DrawText(g, title, IdFont, new Rectangle(pad, band + (int)(rest * 0.12f), Width - 2 * pad, (int)(rest * 0.44f)), Theme.Ink, Theme.Line);
+            TextRenderer.DrawText(g, sub, SmallFont, new Rectangle(pad, band + (int)(rest * 0.56f), Width - 2 * pad, (int)(rest * 0.32f)), online ? Theme.Green : Theme.Muted, Theme.Line);
         }
     }
 

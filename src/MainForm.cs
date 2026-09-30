@@ -56,6 +56,7 @@ namespace RemoteDesk
         public string Server = Brand.DefaultRelay;
         public bool Consent = true;
         public bool RunRelay;
+        public bool Discoverable = true;
         public List<KeyValuePair<string, DateTime>> Recent = new List<KeyValuePair<string, DateTime>>();
         public List<Contact> Contacts = new List<Contact>();
         public List<HistoryItem> History = new List<HistoryItem>();
@@ -85,6 +86,7 @@ namespace RemoteDesk
                     else if (k == "server") s.Server = v;
                     else if (k == "consent") s.Consent = v != "0";
                     else if (k == "relay") s.RunRelay = v == "1";
+                    else if (k == "lan") s.Discoverable = v != "0";
                     else if (k == "recent") s.ParseRecent(v);
                     else if (k == "contacts") s.ParseContacts(v);
                     else if (k == "history") s.ParseHistory(v);
@@ -164,7 +166,7 @@ namespace RemoteDesk
             try
             {
                 File.WriteAllLines(FilePath, new string[] {
-                    "id=" + Id, "server=" + Server, "consent=" + (Consent ? "1" : "0"), "relay=" + (RunRelay ? "1" : "0"),
+                    "id=" + Id, "server=" + Server, "consent=" + (Consent ? "1" : "0"), "relay=" + (RunRelay ? "1" : "0"), "lan=" + (Discoverable ? "1" : "0"),
                     "recent=" + string.Join(";", rec), "contacts=" + string.Join(";", con), "history=" + string.Join(";", his)
                 });
             }
@@ -203,6 +205,7 @@ namespace RemoteDesk
         ViewerForm outView;
         string outId;
         DateTime outStart;
+        bool outDirect;
         string inWho;
         DateTime inStart;
         string resultTitle, resultText;
@@ -249,7 +252,7 @@ namespace RemoteDesk
             WireHost();
             ShowPage(0);
             RefreshHero();
-            FormClosing += delegate { host.Stop(); RelayServer.Stop(); };
+            FormClosing += delegate { host.Stop(); RelayServer.Stop(); Lan.Stop(); };
             Shown += delegate { RebuildDevices(); RebuildContacts(); RebuildSessions(); SetStatus(lastStatus); idInput.Box.Focus(); };
         }
 
@@ -285,6 +288,7 @@ namespace RemoteDesk
                 nav[i].Selected = i == index;
             }
             pageTitle.Text = PageNames[index];
+            if (index == 1) { Lan.Query(); RebuildDevices(); }
         }
 
         static Panel NewPage() { return new Panel { BackColor = Theme.Surface }; }
@@ -355,8 +359,7 @@ namespace RemoteDesk
         Panel BuildDevicesPage()
         {
             Panel p = NewPage();
-            p.Controls.Add(Caption("COMPUTERS YOU CONNECTED TO", 2, 4));
-            devicesList = List(30, 526, true);
+            devicesList = List(0, 556, true);
             p.Controls.Add(devicesList);
             return p;
         }
@@ -418,7 +421,7 @@ namespace RemoteDesk
             net.Controls.Add(btnDefaultRelay);
             p.Controls.Add(net);
 
-            RoundedPanel sec = Card(0, 166, 738, 110);
+            RoundedPanel sec = Card(0, 166, 738, 146);
             sec.Controls.Add(new GlyphBadge { Glyph = Theme.GShield, Location = new Point(22, 16), Size = new Size(32, 32) });
             sec.Controls.Add(new Label { Text = "Security", Font = new Font("Segoe UI Semibold", 11.5f), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(64, 19) });
             tglConsent = new Toggle { Text = "Ask me before accepting a connection", Checked = cfg.Consent, Location = new Point(24, 66), Size = new Size(400, 24) };
@@ -428,9 +431,12 @@ namespace RemoteDesk
             newPwd.SetBounds(560, 58, 156, 38);
             newPwd.Click += delegate { host.NewPassword(); Flash(newPwd); };
             sec.Controls.Add(newPwd);
+            Toggle tglLan = new Toggle { Text = "Let computers on my network find this desk", Checked = cfg.Discoverable, Location = new Point(24, 104), Size = new Size(460, 24) };
+            tglLan.CheckedChanged += delegate { cfg.Discoverable = tglLan.Checked; Lan.Discoverable = cfg.Discoverable; cfg.Save(); };
+            sec.Controls.Add(tglLan);
             p.Controls.Add(sec);
 
-            RoundedPanel about = Card(0, 292, 738, 110);
+            RoundedPanel about = Card(0, 328, 738, 110);
             about.Controls.Add(new MarkLogo { Location = new Point(24, 30), Size = new Size(48, 48) });
             about.Controls.Add(new Label { Text = Brand.Name, Font = new Font("Segoe UI", 14f, FontStyle.Bold), ForeColor = Theme.Ink, AutoSize = true, Location = new Point(86, 24) });
             about.Controls.Add(new TwoTone { A = "Less waiting.", B = "More fixing.", Location = new Point(91, 60), Size = new Size(260, 24) });
@@ -458,17 +464,50 @@ namespace RemoteDesk
             return empty;
         }
 
+        string lanShown = "";
+
+        // Section heading that starts a new row in the devices list.
+        Label ListHeading(string text, bool first)
+        {
+            float k = K;
+            Label l = Caption(text, 0, 0);
+            l.AutoSize = false;
+            l.Size = new Size((int)(714 * k), (int)(22 * k));
+            l.Margin = new Padding((int)(2 * k), first ? 0 : (int)(8 * k), 0, (int)(6 * k));
+            return l;
+        }
+
         void RebuildDevices()
         {
             float k = K;
             devicesList.SuspendLayout();
             Clear(devicesList);
+
+            List<LanDevice> lan = Lan.Devices();
+            lanShown = LanSignature(lan);
+            devicesList.Controls.Add(ListHeading("ON THIS NETWORK", true));
+            if (lan.Count == 0)
+            {
+                Label none = new Label { Text = cfg.Discoverable ? "No other " + Brand.Name + " computers found on this network yet." : "Network discovery is off (Settings > Security).", ForeColor = Theme.Muted, AutoSize = false, Size = new Size((int)(714 * k), (int)(24 * k)), Margin = new Padding((int)(2 * k), 0, 0, (int)(10 * k)) };
+                devicesList.Controls.Add(none);
+            }
+            foreach (LanDevice d in lan)
+            {
+                string id = d.Id;
+                DeviceTile t = new DeviceTile(d.Name, Theme.FormatId(d.Id), true) { Size = new Size((int)(226 * k), (int)(130 * k)), Margin = new Padding(0, 0, (int)(18 * k), (int)(18 * k)) };
+                t.Click += delegate { StartConnect(id); };
+                tip.SetToolTip(t, "Connect directly to " + d.Name + " (" + d.Direct.Address + ")");
+                devicesList.Controls.Add(t);
+            }
+            if (devicesList.Controls.Count > 0) devicesList.SetFlowBreak(devicesList.Controls[devicesList.Controls.Count - 1], true);
+
+            devicesList.Controls.Add(ListHeading("COMPUTERS YOU CONNECTED TO", false));
             if (cfg.Recent.Count == 0)
                 devicesList.Controls.Add(EmptyCard(Theme.GMonitor, "No devices yet", "Computers you connect to show up here - one click to reconnect."));
             foreach (KeyValuePair<string, DateTime> r in cfg.Recent)
             {
                 string id = r.Key;
-                RecentTile t = new RecentTile(id, r.Value) { Size = new Size((int)(226 * k), (int)(130 * k)), Margin = new Padding(0, 0, (int)(18 * k), (int)(18 * k)) };
+                DeviceTile t = new DeviceTile(Theme.FormatId(id), "Connected " + Theme.Ago(r.Value), false) { Size = new Size((int)(226 * k), (int)(130 * k)), Margin = new Padding(0, 0, (int)(18 * k), (int)(18 * k)) };
                 t.Click += delegate { StartConnect(id); };
                 ContextMenuStrip menu = new ContextMenuStrip();
                 menu.Items.Add("Connect", null, delegate { StartConnect(id); });
@@ -562,7 +601,7 @@ namespace RemoteDesk
             if (connectingTo != null)
                 hero.Set(Theme.GClock, Theme.Amber, "Connecting…", connectingText, null, null, null, "Cancel", delegate { if (cancelConnect != null) cancelConnect(); });
             else if (outView != null)
-                hero.Set(Theme.GCheck, Theme.Green, "Connected", "Remote device is ready.", Theme.FormatId(outId), "Online", Theme.Clock(DateTime.UtcNow - outStart), "Disconnect", delegate { if (outView != null) outView.Close(); });
+                hero.Set(Theme.GCheck, Theme.Green, "Connected", "Remote device is ready.", Theme.FormatId(outId), outDirect ? "Online · direct" : "Online · via relay", Theme.Clock(DateTime.UtcNow - outStart), "Disconnect", delegate { if (outView != null) outView.Close(); });
             else if (inWho != null)
                 hero.Set(Theme.GShield, Theme.Primary, "Someone is connected", "They can see and control this computer.", inWho, "Viewing this desk", Theme.Clock(DateTime.UtcNow - inStart), "Disconnect", delegate { host.AbortSession(); });
             else if (resultTitle != null)
@@ -571,10 +610,21 @@ namespace RemoteDesk
                 hero.Set(Theme.GMonitor, Theme.Primary, "Ready to connect", "Enter a desk ID above, or pick one from Devices or Contacts.", null, null, null, null, null);
         }
 
+        int ticks;
+
         void Tick()
         {
             if (outView != null && connectingTo == null) hero.SetTime(Theme.Clock(DateTime.UtcNow - outStart));
             else if (inWho != null && connectingTo == null) hero.SetTime(Theme.Clock(DateTime.UtcNow - inStart));
+            // keep the "On this network" list current while the Devices page is open
+            if (++ticks % 2 == 0 && pages[1].Visible && LanSignature(Lan.Devices()) != lanShown) RebuildDevices();
+        }
+
+        static string LanSignature(List<LanDevice> list)
+        {
+            string s = "";
+            foreach (LanDevice d in list) s += d.Id + "@" + d.Direct + ";";
+            return s;
         }
 
         void SetResult(bool error, string title, string text)
@@ -602,6 +652,8 @@ namespace RemoteDesk
             SetStatus("Starting...");
             if (cfg.RunRelay) UseLocalRelay(false); else RelayNote();
             host.Start();
+            Lan.Discoverable = cfg.Discoverable;
+            Lan.Start(cfg.Id, host.AcceptDirect);
             tglRelay.CheckedChanged += delegate
             {
                 cfg.RunRelay = tglRelay.Checked;
@@ -761,39 +813,59 @@ namespace RemoteDesk
             btnConnect.Enabled = false;
             resultTitle = null;
             connectingTo = fid;
-            connectingText = "Contacting the relay server...";
+            LanDevice lan = Lan.Find(id);
+            connectingText = lan != null ? "Looking for " + lan.Name + " on your network..." : "Contacting the relay server...";
             RefreshHero();
-            cancelConnect = Connector.Start(cfg.Server, id, pwd,
-                delegate(string s) { UI(delegate { connectingText = s; RefreshHero(); }); },
-                delegate(Channel ch)
+
+            // Same network: try a direct connection first (fast, no internet needed), otherwise
+            // or if that fails, go through the relay server.
+            bool cancelled = false;
+            cancelConnect = delegate { cancelled = true; };
+            System.Threading.Thread route = new System.Threading.Thread(delegate()
+            {
+                bool direct = lan != null && Lan.Reachable(lan.Direct, 1500);
+                string server = direct ? lan.Direct.ToString() : cfg.Server;
+                UI(delegate
                 {
-                    UI(delegate
-                    {
-                        EndConnect();
-                        cfg.AddRecent(id);
-                        cfg.Save();
-                        RebuildDevices();
-                        OpenViewer(ch, id);
-                    });
-                },
-                delegate(string err)
-                {
-                    UI(delegate
-                    {
-                        EndConnect();
-                        if (err == "Cancelled") SetResult(false, "Connection cancelled", "No connection was made.");
-                        else SetResult(true, "Couldn't connect", err);
-                    });
+                    if (cancelled) { EndConnect(); SetResult(false, "Connection cancelled", "No connection was made."); return; }
+                    connectingText = direct ? "Connecting directly on your network..." : "Contacting the relay server...";
+                    RefreshHero();
+                    cancelConnect = Connector.Start(server, id, pwd,
+                        delegate(string s) { UI(delegate { connectingText = s; RefreshHero(); }); },
+                        delegate(Channel ch)
+                        {
+                            UI(delegate
+                            {
+                                EndConnect();
+                                cfg.AddRecent(id);
+                                cfg.Save();
+                                RebuildDevices();
+                                OpenViewer(ch, id, direct);
+                            });
+                        },
+                        delegate(string err)
+                        {
+                            UI(delegate
+                            {
+                                EndConnect();
+                                if (err == "Cancelled") SetResult(false, "Connection cancelled", "No connection was made.");
+                                else SetResult(true, "Couldn't connect", err);
+                            });
+                        });
                 });
+            });
+            route.IsBackground = true;
+            route.Start();
         }
 
-        void OpenViewer(Channel ch, string id)
+        void OpenViewer(Channel ch, string id, bool direct)
         {
             string fid = Theme.FormatId(id);
             DateTime start = DateTime.UtcNow;
-            ViewerForm v = new ViewerForm(ch, Brand.Name + " - " + fid);
+            ViewerForm v = new ViewerForm(ch, Brand.Name + " - " + fid + (direct ? "  (local network)" : ""));
             outView = v;
             outId = id;
+            outDirect = direct;
             outStart = start;
             v.FormClosed += delegate
             {
