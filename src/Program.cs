@@ -126,30 +126,36 @@ namespace RemoteDesk
             }
         }
 
-        // Connects once and returns "connected" or the error text; retries while the host is
-        // still re-registering with the relay after the previous session.
-        static string TryConnect(string server, string id, string password, StringBuilder log)
+        // Connects and returns the channel (null + error on failure); retries while the host
+        // is still (re-)registering with the relay, e.g. right after the previous session.
+        static Channel ConnectRetry(string server, string id, string password, out string error)
         {
-            string result = "timeout";
-            for (int attempt = 0; attempt < 5; attempt++)
+            error = "timeout";
+            for (int attempt = 0; attempt < 8; attempt++)
             {
                 Channel ch = null;
                 string err = null;
                 ManualResetEvent done = new ManualResetEvent(false);
                 Connector.Start(server, id, password, delegate { }, delegate(Channel c) { ch = c; done.Set(); }, delegate(string e) { err = e; done.Set(); });
-                if (!done.WaitOne(20000)) return "timeout";
-                if (ch != null)
-                {
-                    ch.Send('X', null);
-                    ch.Close();
-                    Thread.Sleep(1500);
-                    return "connected";
-                }
-                result = err;
-                if (err == null || !err.Contains("not found")) return result;
+                if (!done.WaitOne(20000)) return null;
+                if (ch != null) { error = null; return ch; }
+                error = err;
+                if (err == null || !err.Contains("not found")) return null;
                 Thread.Sleep(1000);
             }
-            return result;
+            return null;
+        }
+
+        // Connects, hangs up, and returns "connected" or the error text.
+        static string TryConnect(string server, string id, string password, StringBuilder log)
+        {
+            string err;
+            Channel ch = ConnectRetry(server, id, password, out err);
+            if (ch == null) return err;
+            ch.Send('X', null);
+            ch.Close();
+            Thread.Sleep(1500);
+            return "connected";
         }
 
         // Headless end-to-end check: host + viewer in one process through the relay.
@@ -283,8 +289,39 @@ namespace RemoteDesk
                 log.AppendLine("unattended password without anyone accepting: " + (unattendedOk ? "OK, connected" : "FAILED"));
                 log.AppendLine("session password with nobody accepting: " + (consentOk ? "OK, declined as expected" : "FAILED (" + attended + ")"));
 
+                // remote restart + reconnect: a stand-in for the real restart takes the host
+                // offline for a few seconds, like a reboot would.
+                bool restartAsked = false, comesBack = false;
+                host.ComesBackAfterRestart = delegate { return true; };
+                host.Restart = delegate
+                {
+                    restartAsked = true;
+                    ThreadPool.QueueUserWorkItem(delegate { Thread.Sleep(500); host.Stop(); Thread.Sleep(3000); host.Start(); });
+                };
+                string rerr;
+                Channel rc = ConnectRetry(server, host.Id, "TESTPASS99", out rerr);
+                if (rc == null) log.AppendLine("restart test connect failed: " + rerr);
+                else
+                {
+                    rc.Send('r', null);
+                    try
+                    {
+                        DateTime rend = DateTime.UtcNow.AddSeconds(10);
+                        while (DateTime.UtcNow < rend)
+                        {
+                            byte[] d;
+                            if (rc.Recv(out d) == 'q') { comesBack = Proto.Int(d, 0) != 0; break; }
+                        }
+                    }
+                    catch { }
+                    rc.Close();
+                }
+                Thread.Sleep(1000);
+                bool reconnected = restartAsked && comesBack && TryConnect(server, host.Id, "TESTPASS99", log) == "connected";
+                log.AppendLine("remote restart: " + (restartAsked ? "requested" : "NOT requested") + ", viewer told it comes back: " + comesBack + ", reconnected afterwards: " + reconnected);
+
                 host.Stop();
-                log.AppendLine(rects > 0 && fileOk && lanOk && directOk && unattendedOk && consentOk ? "SELFTEST PASS" : "SELFTEST FAIL");
+                log.AppendLine(rects > 0 && fileOk && lanOk && directOk && unattendedOk && consentOk && reconnected ? "SELFTEST PASS" : "SELFTEST FAIL");
             }
             catch (Exception ex) { log.AppendLine("SELFTEST FAIL: " + ex); }
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest.txt"), log.ToString());

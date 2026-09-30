@@ -834,6 +834,12 @@ namespace RemoteDesk
             host.SetClipboard = delegate(string t) { UI(delegate { Clip(t); }); };
             host.SessionChanged = OnSessionChanged;
             host.Consent = AskConsent;
+            host.ComesBackAfterRestart = delegate
+            {
+                bool autostart = false;
+                try { autostart = Autostart.Enabled; } catch { }
+                return cfg.Unattended && cfg.UnattendedKey != null && autostart;
+            };
             host.NewPassword();
             lblPwd.Text = host.Password;
             SetStatus("Starting...");
@@ -1008,53 +1014,56 @@ namespace RemoteDesk
             LanDevice lan = Lan.Find(id);
             connectingText = lan != null ? "Looking for " + lan.Name + " on your network..." : "Contacting the relay server...";
             RefreshHero();
+            cancelConnect = Dial(id, pwd,
+                delegate(string s) { connectingText = s; RefreshHero(); },
+                delegate(Channel ch, bool direct)
+                {
+                    EndConnect();
+                    cfg.AddRecent(id);
+                    if (remember) cfg.Saved[id] = pwd;
+                    cfg.Save();
+                    RebuildDevices();
+                    OpenViewer(ch, id, direct, pwd);
+                },
+                delegate(string err)
+                {
+                    EndConnect();
+                    if (err == "Cancelled") SetResult(false, "Connection cancelled", "No connection was made.");
+                    else if (usedSaved && err == "Wrong password")
+                    {
+                        cfg.Saved.Remove(id);
+                        cfg.Save();
+                        SetResult(true, "Saved password no longer works", "The password for " + fid + " has changed. Connect again and enter the new one.");
+                    }
+                    else SetResult(true, "Couldn't connect", err);
+                });
+        }
 
-            // Same network: try a direct connection first (fast, no internet needed), otherwise
-            // or if that fails, go through the relay server.
+        // Connects to a desk: directly when it's on this network (fast, no internet needed),
+        // otherwise - or if that fails - through the relay server. Callbacks run on the UI
+        // thread. Returns an action that cancels the attempt.
+        Action Dial(string id, string pwd, Action<string> progress, Action<Channel, bool> ok, Action<string> fail)
+        {
+            LanDevice lan = Lan.Find(id);
             bool cancelled = false;
-            cancelConnect = delegate { cancelled = true; };
+            Action inner = null;
             System.Threading.Thread route = new System.Threading.Thread(delegate()
             {
                 bool direct = lan != null && Lan.Reachable(lan.Direct, 1500);
                 string server = direct ? lan.Direct.ToString() : cfg.Server;
                 UI(delegate
                 {
-                    if (cancelled) { EndConnect(); SetResult(false, "Connection cancelled", "No connection was made."); return; }
-                    connectingText = direct ? "Connecting directly on your network..." : "Contacting the relay server...";
-                    RefreshHero();
-                    cancelConnect = Connector.Start(server, id, pwd,
-                        delegate(string s) { UI(delegate { connectingText = s; RefreshHero(); }); },
-                        delegate(Channel ch)
-                        {
-                            UI(delegate
-                            {
-                                EndConnect();
-                                cfg.AddRecent(id);
-                                if (remember) cfg.Saved[id] = pwd;
-                                cfg.Save();
-                                RebuildDevices();
-                                OpenViewer(ch, id, direct, pwd);
-                            });
-                        },
-                        delegate(string err)
-                        {
-                            UI(delegate
-                            {
-                                EndConnect();
-                                if (err == "Cancelled") SetResult(false, "Connection cancelled", "No connection was made.");
-                                else if (usedSaved && err == "Wrong password")
-                                {
-                                    cfg.Saved.Remove(id);
-                                    cfg.Save();
-                                    SetResult(true, "Saved password no longer works", "The password for " + fid + " has changed. Connect again and enter the new one.");
-                                }
-                                else SetResult(true, "Couldn't connect", err);
-                            });
-                        });
+                    if (cancelled) { fail("Cancelled"); return; }
+                    progress(direct ? "Connecting directly on your network..." : "Contacting the relay server...");
+                    inner = Connector.Start(server, id, pwd,
+                        delegate(string s) { UI(delegate { progress(s); }); },
+                        delegate(Channel ch) { UI(delegate { ok(ch, direct); }); },
+                        delegate(string err) { UI(delegate { fail(err); }); });
                 });
             });
             route.IsBackground = true;
             route.Start();
+            return delegate { cancelled = true; if (inner != null) inner(); };
         }
 
         void OpenViewer(Channel ch, string id, bool direct, string pwd)
@@ -1066,16 +1075,20 @@ namespace RemoteDesk
             outId = id;
             outDirect = direct;
             outStart = start;
+            bool restarting = false, canReconnect = false;
+            v.RemoteRestarting = delegate(bool can) { restarting = true; canReconnect = can; };
             v.FormClosed += delegate
             {
                 cfg.AddHistory(false, fid, start);
                 cfg.Save();
                 RebuildSessions();
-                if (outView == v)
-                {
-                    outView = null;
+                if (outView != v) return;
+                outView = null;
+                if (restarting && canReconnect) StartReconnect(id, pwd);
+                else if (restarting)
+                    SetResult(false, fid + " is restarting", "It can't be reconnected automatically: that computer needs unattended access and Start with Windows turned on. Connect again once it's back.");
+                else
                     SetResult(false, "Session ended", "You were connected to " + fid + " for " + Theme.Clock(DateTime.UtcNow - start) + ".");
-                }
             };
             RefreshHero();
             v.Show();
@@ -1087,6 +1100,82 @@ namespace RemoteDesk
             cancelConnect = null;
             connectingTo = null;
             btnConnect.Enabled = true;
+        }
+
+        // ---- reconnect after a remote restart -------------------------------------------
+
+        string reconnectId, reconnectPwd;
+        DateTime reconnectUntil;
+        Action reconnectCancel;
+        Timer reconnectTimer;
+
+        void StartReconnect(string id, string pwd)
+        {
+            reconnectId = id;
+            reconnectPwd = pwd;
+            reconnectUntil = DateTime.UtcNow.AddMinutes(5);
+            resultTitle = null;
+            connectingTo = Theme.FormatId(id);
+            connectingText = connectingTo + " is restarting. Waiting for it to come back online...";
+            btnConnect.Enabled = false;
+            cancelConnect = delegate
+            {
+                StopReconnect();
+                SetResult(false, "Reconnect cancelled", "Connect again whenever the computer is back.");
+            };
+            RefreshHero();
+            ScheduleReconnect(20000); // give it time to actually shut down first
+        }
+
+        void ScheduleReconnect(int ms)
+        {
+            reconnectTimer = new Timer { Interval = ms };
+            Timer t = reconnectTimer;
+            t.Tick += delegate { t.Stop(); t.Dispose(); TryReconnect(); };
+            t.Start();
+        }
+
+        void TryReconnect()
+        {
+            if (reconnectId == null) return;
+            string id = reconnectId, fid = Theme.FormatId(id);
+            if (DateTime.UtcNow > reconnectUntil)
+            {
+                StopReconnect();
+                SetResult(true, fid + " didn't come back", "It wasn't back online within 5 minutes. Check that it restarted and signed in to Windows.");
+                return;
+            }
+            connectingText = "Waiting for " + fid + " to come back online...";
+            RefreshHero();
+            reconnectCancel = Dial(id, reconnectPwd,
+                delegate(string s) { },
+                delegate(Channel ch, bool direct)
+                {
+                    string pwd = reconnectPwd;
+                    StopReconnect();
+                    OpenViewer(ch, id, direct, pwd);
+                },
+                delegate(string err)
+                {
+                    if (reconnectId == null) return;
+                    // Still booting or signing in: keep trying. A wrong password or someone
+                    // declining means it won't work by waiting.
+                    if (err == "Wrong password" || err.Contains("declined"))
+                    {
+                        StopReconnect();
+                        SetResult(true, "Couldn't reconnect to " + fid, err);
+                    }
+                    else ScheduleReconnect(5000);
+                });
+        }
+
+        void StopReconnect()
+        {
+            reconnectId = null;
+            reconnectPwd = null;
+            if (reconnectTimer != null) { reconnectTimer.Stop(); reconnectTimer.Dispose(); reconnectTimer = null; }
+            if (reconnectCancel != null) { Action c = reconnectCancel; reconnectCancel = null; c(); }
+            EndConnect();
         }
     }
 }

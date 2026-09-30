@@ -63,6 +63,16 @@ namespace RemoteDesk
         // Key derived from the permanent unattended-access password (null = unattended off).
         public volatile byte[] UnattendedKey;
 
+        // True when this desk will be reachable again after a restart (unattended access on and
+        // AleeDesk starting with Windows).
+        public Func<bool> ComesBackAfterRestart;
+
+        // Restarts the computer; replaced by a stand-in in the self-test.
+        public Action Restart = delegate
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("shutdown.exe", "/r /t 5 /c \"AleeDesk: restart requested by the connected user\"") { CreateNoWindow = true, UseShellExecute = false });
+        };
+
         // Too many wrong passwords in a short time locks everyone out for a while, so a
         // permanent password can't be guessed by trying many times.
         readonly Queue<DateTime> failures = new Queue<DateTime>();
@@ -332,6 +342,17 @@ namespace RemoteDesk
                             sess.Scale = Math.Max(25, Math.Min(100, Proto.Int(d, 1)));
                         }
                         break;
+                    case 'r':
+                    {
+                        // Remote restart. Tell the viewer whether it can reconnect afterwards:
+                        // only with the permanent password (the session one changes on restart).
+                        bool back = sess.Unattended && ComesBackAfterRestart != null && ComesBackAfterRestart();
+                        ch.Send('q', Proto.Ints(back ? 1 : 0));
+                        SetStatus("Restarting - requested by the connected user");
+                        Action restart = Restart;
+                        if (restart != null) restart();
+                        break;
+                    }
                     case 'T': StartIncomingFile(sess, d); break;
                     case 'U': WriteFileChunk(sess, d); break;
                     case 'Z': FinishIncomingFile(sess, d); break;

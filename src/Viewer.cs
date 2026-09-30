@@ -120,6 +120,10 @@ namespace RemoteDesk
         IntPtr pointerHandle;
         Rectangle pointerDrawn = Rectangle.Empty;
 
+        // Called when the other computer confirms it's restarting; true = it will be reachable
+        // again, so the main window can reconnect automatically.
+        public Action<bool> RemoteRestarting;
+
         public ViewerForm(Channel ch, string title)
         {
             this.ch = ch;
@@ -156,6 +160,10 @@ namespace RemoteDesk
             ToolStripButton bFull = new ToolStripButton("Fullscreen");
             bFull.Click += delegate { ToggleFullscreen(); };
             bar.Items.Add(bFull);
+            ToolStripButton bRestart = new ToolStripButton("Restart");
+            bRestart.ToolTipText = "Restart the remote computer and reconnect";
+            bRestart.Click += delegate { AskRestart(); };
+            bar.Items.Add(bRestart);
             ToolStripButton bEnd = new ToolStripButton("Disconnect");
             bEnd.Alignment = ToolStripItemAlignment.Right;
             bEnd.ForeColor = Theme.Red;
@@ -282,6 +290,17 @@ namespace RemoteDesk
                             }
                         }
                         RequestPaint();
+                    }
+                    else if (t == 'q' && d.Length >= 4)
+                    {
+                        bool back = Proto.Int(d, 0) != 0;
+                        BeginInvoke(new MethodInvoker(delegate
+                        {
+                            userClosing = true; // not a lost connection - no error message
+                            if (RemoteRestarting != null) RemoteRestarting(back);
+                            Close();
+                        }));
+                        return;
                     }
                     else if (t == 'B') break;
                 }
@@ -552,6 +571,15 @@ namespace RemoteDesk
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        void AskRestart()
+        {
+            DialogResult r = MessageBox.Show(this,
+                "Restart the remote computer now?\n\nUnsaved work on it may be lost. " + Brand.Name + " reconnects automatically when it's back, if that computer has unattended access and Start with Windows turned on.",
+                Brand.Name + " - restart", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (r == DialogResult.Yes) TrySend('r', null);
+            surface.Focus();
         }
 
         void ToggleFullscreen()
