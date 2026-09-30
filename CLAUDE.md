@@ -5,6 +5,15 @@ AnyDesk-style remote desktop for Windows, built for Ali ("ALee"). Brand: **AleeD
 picture top-right. The user is not a developer: explain in plain words, give step-by-step
 instructions, and test changes yourself before reporting.
 
+## Working routine (the user asked for this)
+
+The user works on this project from two PCs, with Claude on both. GitHub keeps them in sync.
+- **Start of a session:** `git pull` before changing anything.
+- **When the user says "finish for today"** (or "done for today" etc.): run `git status`,
+  check nothing unwanted is staged (no `dist/`, no secrets), commit everything with a clear
+  message, and `git push`. Then tell the user in plain words that the work is saved.
+- If no GitHub remote is set yet, say so and ask for the repository address.
+
 ## Build and run
 
 - `powershell -ExecutionPolicy Bypass -File build.ps1` -> `dist\ALeeDesk.exe` (single exe).
