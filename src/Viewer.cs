@@ -124,6 +124,9 @@ namespace RemoteDesk
         // again, so the main window can reconnect automatically.
         public Action<bool> RemoteRestarting;
 
+        FileManagerForm files;
+        string lastClip; // clipboard text last synced, so our own paste isn't sent back
+
         public ViewerForm(Channel ch, string title)
         {
             this.ch = ch;
@@ -154,9 +157,10 @@ namespace RemoteDesk
             StyleCombo(cmbSize);
             bar.Items.Add(cmbSize);
             bar.Items.Add(new ToolStripSeparator());
-            ToolStripButton bClip = new ToolStripButton("Send clipboard");
-            bClip.Click += delegate { SendClipboard(); };
-            bar.Items.Add(bClip);
+            ToolStripButton bFiles = new ToolStripButton("Files");
+            bFiles.ToolTipText = "Browse and copy files between the two computers";
+            bFiles.Click += delegate { OpenFiles(); };
+            bar.Items.Add(bFiles);
             ToolStripButton bFull = new ToolStripButton("Fullscreen");
             bFull.Click += delegate { ToggleFullscreen(); };
             bar.Items.Add(bFull);
@@ -207,6 +211,7 @@ namespace RemoteDesk
                 Application.RemoveMessageFilter(this);
                 ch.Close();
                 if (pointerHandle != IntPtr.Zero) Native.DestroyIcon(pointerHandle);
+                if (files != null && !files.IsDisposed) files.Close();
             };
             Shown += delegate { surface.Focus(); };
         }
@@ -290,6 +295,16 @@ namespace RemoteDesk
                             }
                         }
                         RequestPaint();
+                    }
+                    else if (t == 'C')
+                    {
+                        string text = Proto.Str(d);
+                        BeginInvoke(new MethodInvoker(delegate { lastClip = text; try { Clipboard.SetText(text); } catch { } }));
+                    }
+                    else if ("lfdenxa".IndexOf((char)t) >= 0 && d.Length >= 4)
+                    {
+                        FileManagerForm fm = files;
+                        if (fm != null && !fm.IsDisposed) fm.OnMessage(t, d);
                     }
                     else if (t == 'q' && d.Length >= 4)
                     {
@@ -510,14 +525,78 @@ namespace RemoteDesk
             TrySend('Q', Proto.Ints(q[qi], s[si]));
         }
 
-        void SendClipboard()
+        // ---- clipboard sync and file manager --------------------------------------------
+
+        protected override void OnHandleCreated(EventArgs e)
         {
-            try
+            base.OnHandleCreated(e);
+            Native.AddClipboardFormatListener(Handle);
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            Native.RemoveClipboardFormatListener(Handle);
+            base.OnHandleDestroyed(e);
+        }
+
+        // Text copied on this computer during the session goes to the other one automatically.
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == Native.WM_CLIPBOARDUPDATE)
             {
-                if (Clipboard.ContainsText()) TrySend('C', Encoding.UTF8.GetBytes(Clipboard.GetText()));
+                try
+                {
+                    if (Clipboard.ContainsText())
+                    {
+                        string text = Clipboard.GetText();
+                        if (text != lastClip && text.Length <= 500000)
+                        {
+                            lastClip = text;
+                            TrySend('C', Encoding.UTF8.GetBytes(text));
+                        }
+                    }
+                }
+                catch { } // clipboard busy in another program - skip this change
             }
-            catch { }
-            surface.Focus();
+            base.WndProc(ref m);
+        }
+
+        void OpenFiles()
+        {
+            if (files == null || files.IsDisposed)
+            {
+                files = new FileManagerForm(this, Text.Replace(Brand.Name + " - ", Brand.Name + " files - "));
+                files.Show();
+            }
+            else
+            {
+                if (files.WindowState == FormWindowState.Minimized) files.WindowState = FormWindowState.Normal;
+                files.Activate();
+            }
+        }
+
+        // For the file manager: send a message on this session.
+        internal void Send(char type, byte[] data) { TrySend(type, data); }
+
+        // Sends one file into a folder on the other computer (blocking; call from a worker
+        // thread). The other side replies with 'a' once it's saved.
+        internal void UploadFile(string path, string remoteFolder, Action<long> progress)
+        {
+            int fileId = Interlocked.Increment(ref nextFileId);
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                ch.Send('j', Proto.Cat(Proto.Ints(fileId), Proto.LongBytes(fs.Length), Encoding.UTF8.GetBytes(remoteFolder + "\n" + Path.GetFileName(path))));
+                byte[] buf = new byte[256 * 1024];
+                long sent = 0;
+                int n;
+                while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+                {
+                    ch.Send('U', Proto.Cat(Proto.Ints(fileId), Proto.LongBytes(sent), n == buf.Length ? buf : Proto.Sub(buf, 0, n)));
+                    sent += n;
+                    progress(sent);
+                }
+            }
+            ch.Send('Z', Proto.Ints(fileId));
         }
 
         // ---- outgoing file transfer (drag a file onto the remote screen) ----------------

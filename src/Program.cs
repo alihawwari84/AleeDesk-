@@ -108,11 +108,14 @@ namespace RemoteDesk
             }
             m.Close();
 
-            Form[] forms = { new PasswordDialog("626 941 456"), new ConsentDialog("86.108.23.52"), new SetPasswordDialog() };
-            string[] names = { "ui-password.png", "ui-consent.png", "ui-setpassword.png" };
-            for (int i = 0; i < forms.Length; i++)
+            try { FileManagerShot(dir); }
+            catch (Exception ex) { File.WriteAllText(Path.Combine(dir, "ui-error.txt"), ex.ToString()); }
+
+            Form[] dialogs = { new PasswordDialog("626 941 456"), new ConsentDialog("86.108.23.52"), new SetPasswordDialog() };
+            string[] dialogNames = { "ui-password.png", "ui-consent.png", "ui-setpassword.png" };
+            for (int i = 0; i < dialogs.Length; i++)
             {
-                Form f = forms[i];
+                Form f = dialogs[i];
                 f.StartPosition = FormStartPosition.Manual;
                 f.Location = new Point(-4000, -4000);
                 f.Show();
@@ -120,10 +123,30 @@ namespace RemoteDesk
                 using (Bitmap b = new Bitmap(f.Width, f.Height))
                 {
                     f.DrawToBitmap(b, new Rectangle(0, 0, f.Width, f.Height));
-                    b.Save(Path.Combine(dir, names[i]));
+                    b.Save(Path.Combine(dir, dialogNames[i]));
                 }
                 f.Close();
             }
+        }
+
+        // The file manager, with Documents on the remote side (from this PC).
+        static void FileManagerShot(string dir)
+        {
+            ViewerForm vf = new ViewerForm(new Channel(new MemoryStream()), Brand.Name + " - 512 734 096");
+            FileManagerForm fmf = new FileManagerForm(vf, Brand.Name + " files - 512 734 096");
+            fmf.StartPosition = FormStartPosition.Manual;
+            fmf.Location = new Point(-6000, -6000);
+            fmf.Show();
+            for (int i = 0; i < 5; i++) { Application.DoEvents(); Thread.Sleep(40); }
+            fmf.OnMessage((byte)'l', Proto.Cat(Proto.Ints(1), Encoding.UTF8.GetBytes(FileListing.Describe(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)))));
+            for (int i = 0; i < 5; i++) { Application.DoEvents(); Thread.Sleep(40); }
+            using (Bitmap b = new Bitmap(fmf.Width, fmf.Height))
+            {
+                fmf.DrawToBitmap(b, new Rectangle(0, 0, fmf.Width, fmf.Height));
+                b.Save(Path.Combine(dir, "ui-files.png"));
+            }
+            fmf.Close();
+            vf.Dispose();
         }
 
         // Connects and returns the channel (null + error on failure); retries while the host
@@ -156,6 +179,72 @@ namespace RemoteDesk
             ch.Close();
             Thread.Sleep(1500);
             return "connected";
+        }
+
+        static bool Same(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        // Clipboard both ways, and the file manager: list a folder, upload into a chosen
+        // folder, download a whole folder (with a sub-folder) - all over the live session.
+        static void ClipboardAndFilesTest(HostService host, Channel channel, StringBuilder log, out bool clipOk, out bool fmOk)
+        {
+            string gotOnHost = null, gotOnViewer = null;
+            host.SetClipboard = delegate(string t) { gotOnHost = t; };
+
+            string dir = Path.Combine(Path.GetTempPath(), "RemoteDeskFM_" + Guid.NewGuid().ToString("N"));
+            string src = Path.Combine(dir, "src"), up = Path.Combine(dir, "up");
+            Directory.CreateDirectory(Path.Combine(src, "inner"));
+            Random rnd = new Random(7);
+            byte[] a = new byte[50000], b = new byte[300000], u = new byte[120000];
+            rnd.NextBytes(a); rnd.NextBytes(b); rnd.NextBytes(u);
+            File.WriteAllBytes(Path.Combine(src, "a.txt"), a);
+            File.WriteAllBytes(Path.Combine(src, "inner", "b.bin"), b);
+
+            channel.Send('C', Encoding.UTF8.GetBytes("copied on the viewer"));
+            host.SendClipboard("copied on the host");
+            channel.Send('L', Proto.Cat(Proto.Ints(1), Encoding.UTF8.GetBytes(src)));
+            channel.Send('j', Proto.Cat(Proto.Ints(900), Proto.LongBytes(u.Length), Encoding.UTF8.GetBytes(up + "\nuploaded.dat")));
+            for (int off = 0; off < u.Length; off += 65536)
+                channel.Send('U', Proto.Cat(Proto.Ints(900), Proto.LongBytes(off), Proto.Sub(u, off, Math.Min(65536, u.Length - off))));
+            channel.Send('Z', Proto.Ints(900));
+            channel.Send('g', Proto.Cat(Proto.Ints(2), Encoding.UTF8.GetBytes(src)));
+
+            bool listed = false, uploaded = false, downloadDone = false;
+            System.Collections.Generic.Dictionary<string, byte[]> got = new System.Collections.Generic.Dictionary<string, byte[]>();
+            string curName = null;
+            MemoryStream cur = null;
+            DateTime end = DateTime.UtcNow.AddSeconds(40);
+            while (DateTime.UtcNow < end && !(listed && uploaded && downloadDone && gotOnViewer != null))
+            {
+                byte[] d;
+                byte t = channel.Recv(out d);
+                if (t == 'C') gotOnViewer = Proto.Str(d);
+                else if (t == 'l' && Proto.Int(d, 0) == 1)
+                {
+                    string listing = Proto.Str(Proto.Sub(d, 4, d.Length - 4));
+                    listed = listing.Contains("\ta.txt\t") && listing.Contains("\tinner\t");
+                }
+                else if (t == 'a' && Proto.Int(d, 0) == 900) uploaded = Proto.Int(d, 1) == 1;
+                else if (t == 'f' && Proto.Int(d, 0) == 2) { curName = Proto.Str(Proto.Sub(d, 12, d.Length - 12)); cur = new MemoryStream(); }
+                else if (t == 'd' && Proto.Int(d, 0) == 2 && cur != null) cur.Write(d, 12, d.Length - 12);
+                else if (t == 'e' && Proto.Int(d, 0) == 2 && cur != null) { got[curName] = cur.ToArray(); cur = null; }
+                else if (t == 'n' && Proto.Int(d, 0) == 2) downloadDone = true;
+                else if (t == 'x') log.AppendLine("file manager error: " + Proto.Str(Proto.Sub(d, 4, d.Length - 4)));
+            }
+            for (int i = 0; i < 30 && gotOnHost == null; i++) Thread.Sleep(100);
+
+            clipOk = gotOnHost == "copied on the viewer" && gotOnViewer == "copied on the host";
+            byte[] ga, gb;
+            bool downloadOk = downloadDone && got.TryGetValue("src\\a.txt", out ga) && Same(ga, a) && got.TryGetValue("src\\inner\\b.bin", out gb) && Same(gb, b);
+            bool uploadOk = uploaded && File.Exists(Path.Combine(up, "uploaded.dat")) && Same(File.ReadAllBytes(Path.Combine(up, "uploaded.dat")), u);
+            fmOk = listed && uploadOk && downloadOk;
+            log.AppendLine("clipboard viewer->host: " + (gotOnHost == "copied on the viewer" ? "OK" : "FAILED") + ", host->viewer: " + (gotOnViewer == "copied on the host" ? "OK" : "FAILED"));
+            log.AppendLine("file manager: listing " + (listed ? "OK" : "FAILED") + ", upload into folder " + (uploadOk ? "OK" : "FAILED") + ", folder download " + (downloadOk ? "OK (" + got.Count + " files, bytes match)" : "FAILED (" + got.Count + " files)"));
+            try { Directory.Delete(dir, true); } catch { }
         }
 
         // Headless end-to-end check: host + viewer in one process through the relay.
@@ -238,6 +327,10 @@ namespace RemoteDesk
                 }
                 log.AppendLine("file transfer: " + (fileOk ? "OK, bytes match" : "FAILED, exists=" + File.Exists(expectedPath)));
                 try { Directory.Delete(saveDir, true); } catch { }
+
+                bool clipOk, fmOk;
+                ClipboardAndFilesTest(host, channel, log, out clipOk, out fmOk);
+                fileOk = fileOk && clipOk && fmOk;
 
                 channel.Send('X', null);
                 channel.Close();

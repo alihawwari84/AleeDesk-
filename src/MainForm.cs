@@ -379,6 +379,39 @@ namespace RemoteDesk
             tray.Dispose();
         }
 
+        // ---- clipboard: text copied here during a session goes to the viewer --------------
+
+        string hostClip; // last text received from the viewer, so pasting it isn't sent back
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Native.AddClipboardFormatListener(Handle);
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            Native.RemoveClipboardFormatListener(Handle);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == Native.WM_CLIPBOARDUPDATE && inWho != null)
+            {
+                try
+                {
+                    if (Clipboard.ContainsText())
+                    {
+                        string text = Clipboard.GetText();
+                        if (text != hostClip) { hostClip = text; host.SendClipboard(text); }
+                    }
+                }
+                catch { } // clipboard busy in another program
+            }
+            base.WndProc(ref m);
+        }
+
         protected override void SetVisibleCore(bool value)
         {
             if (startHidden)
@@ -831,7 +864,7 @@ namespace RemoteDesk
             host.RequireConsent = cfg.Consent;
             host.PasswordChanged = delegate { UI(delegate { lblPwd.Text = host.Password; }); };
             host.Status = delegate(string s) { lastStatus = s; UI(delegate { SetStatus(s); }); };
-            host.SetClipboard = delegate(string t) { UI(delegate { Clip(t); }); };
+            host.SetClipboard = delegate(string t) { UI(delegate { hostClip = t; Clip(t); }); };
             host.SessionChanged = OnSessionChanged;
             host.Consent = AskConsent;
             host.ComesBackAfterRestart = delegate

@@ -27,13 +27,17 @@ The user works on this project from two PCs, with Claude on both. GitHub keeps t
 ## Tests (run these after changes)
 
 - `dist\ALeeDesk.exe --selftest <relay>` -> writes `dist\selftest.txt`, ends with
-  `SELFTEST PASS`. Host + viewer in one process: wrong password rejected, encrypted channel,
-  screen frames, pointer shape/position, 600 KB file transfer verified byte-for-byte.
-  Use `5.189.191.129:7788` (real relay), or start the app with `relay=1` in settings.ini to
-  test against `127.0.0.1:7788`. Note: it moves the real mouse to the screen centre.
+  `SELFTEST PASS` (takes 1-2 minutes). Host + viewer in one process: wrong password rejected,
+  encrypted channel, screen frames, pointer, drag-drop file transfer, clipboard both ways,
+  file manager (list, upload into folder, folder download), LAN discovery + direct session,
+  unattended vs. attended access, remote restart + reconnect (restart is a stand-in).
+  Use `5.189.191.129:7788` (real relay). Close the app first (it holds UDP 7789/TCP 7790).
+  Note: it moves the real mouse to the screen centre.
 - `--viewtest <relay>` opens a real viewer window and saves `viewer.png` next to the exe.
-- `--uishot <dir>` renders all five pages and both dialogs to `ui-*.png` (uses the data in
-  settings.ini; back it up and restore it if you inject sample data).
+- `--uishot <dir>` renders the five pages, the file manager and the dialogs to `ui-*.png`
+  (uses the data in settings.ini; back it up and restore it if you inject sample data).
+  The self-test doesn't open windows, so check new UI with `--uishot` - it caught a crash
+  in the file manager that the self-test couldn't.
 - To screenshot the live window use PrintWindow (another window may cover it).
 
 ## Architecture
@@ -45,17 +49,33 @@ The user works on this project from two PCs, with Claude on both. GitHub keeps t
 - **Handshake** (host<->viewer, through the relay): `N` nonce, `A` proof (HMAC of
   PBKDF2(password, "RemoteDesk|"+id)), `F` wrong / `Y` host proof. Then AES-256-CBC +
   HMAC-SHA256 with counters (`Channel.EnableSecurity`). Never change the salt string.
+- **Passwords:** the one-time session password needs someone to click Accept; the permanent
+  unattended password (Settings) skips that. Both are case-insensitive (upper-cased before
+  PBKDF2). Only the derived key is stored, DPAPI-encrypted (`Secret` class). 10 wrong
+  passwords in 10 minutes locks everyone out for a while.
 - **Encrypted session messages**
-  - host -> viewer: `W` waiting consent, `G` granted, `D` denied, `S` w,h, `R` x,y,w,h+jpeg,
-    `c` pointer shape (hotX,hotY+png), `p` pointer pos (x,y,visible)
+  - host -> viewer: `W` waiting consent, `G` granted, `D` denied/busy, `S` w,h,
+    `R` x,y,w,h+jpeg, `c` pointer shape (hotX,hotY+png), `p` pointer pos (x,y,visible),
+    `C` clipboard text, `q` restarting (1 = will come back), file manager replies:
+    `l` listing, `f`/`d`/`e` file start/chunk/end, `n` request done, `x` error, `a` upload saved
   - viewer -> host: `M` mouse, `k` key, `C` clipboard, `Q` quality,scale, `T`/`U`/`Z` file
-    start/chunk/end, `X` bye
+    to Desktop, `j`/`U`/`Z` file into a folder, `L` list folder, `g` get file/folder,
+    `r` restart, `X` bye
   - Unknown types are ignored, so old and new versions don't crash each other.
+- **LAN** (`Lan.cs`): UDP 7789 announcements/queries (`ALDA|id|name|port|version`, `ALDQ`),
+  TCP 7790 direct sessions (same opening as the relay). Viewer tries direct first, then relay.
+- **Tray / autostart:** HKCU Run `AleeDesk` = `"exe" --background`; closing the window hides
+  it while unattended/autostart is on; launching the exe again signals the running copy
+  (named event `RemoteDesk.Show`) to show its window.
+- **Restart:** host runs `shutdown /r /t 5`; the viewer's main window reconnects for up to
+  5 minutes. Only works with the unattended password + autostart, and only after Windows
+  signs in (no Windows service yet).
 - Screen: GDI BitBlt, 64px tile diff, changed areas sent as separate JPEG rectangles,
   ~30 fps cap. The pointer is NOT drawn into frames; the viewer uses the remote pointer shape
   as its own local cursor (instant) and only draws the remote pointer when it moves remotely.
 - Settings: `%APPDATA%\RemoteDesk\settings.ini` (folder name kept from v1 so the desk ID
-  survives). Keys: id, server, consent, relay, recent, contacts, history.
+  survives). Keys: id, server, consent, relay, lan, unattended, ukey (encrypted), saved
+  (encrypted remembered passwords per desk), recent, contacts, history.
 - One instance per PC (mutex `RemoteDesk.SingleInstance`) because the ID is per PC.
 
 ## Relay server (VPS)
@@ -76,8 +96,13 @@ The user works on this project from two PCs, with Claude on both. GitHub keeps t
 
 ## Ideas / not done yet
 
-- Version check in the handshake (warn when the two PCs run different builds).
-- Admin/UAC and lock-screen control (needs a Windows service running as SYSTEM) and
-  unattended access - the user deferred this.
-- Download direction for files + a file browser; multi-monitor; audio; clipboard auto-sync.
-- A domain name for the relay instead of the IP; code signing; an installer.
+The user asked for AnyDesk's feature list. Done: LAN discovery, unattended access, remote
+restart + reconnect, file manager + clipboard sync. Still to do, roughly in order:
+- **Adaptive streaming** (quality/frame rate follow the connection); later real H.264 via
+  Windows Media Foundation instead of JPEG tiles.
+- **Teams "Request support"** button posting to an IT channel via a Workflows webhook, with
+  `aleedesk://connect/<id>` links (the user picked this option).
+- Windows service (SYSTEM) for UAC prompts, lock screen and reconnect before sign-in.
+- Browser viewer for Mac/Linux/phones (native clients are separate projects).
+- Version check in the handshake; multi-monitor; audio; domain name for the relay; code
+  signing; installer.

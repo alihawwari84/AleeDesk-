@@ -37,6 +37,8 @@ namespace RemoteDesk
             public FileStream Stream;
             public string TempPath, FinalPath, Name;
             public long Expected, Written;
+            public string Folder;
+            public bool Ack; // from the file manager: report back when saved
         }
 
         public string Id;
@@ -353,7 +355,10 @@ namespace RemoteDesk
                         if (restart != null) restart();
                         break;
                     }
-                    case 'T': StartIncomingFile(sess, d); break;
+                    case 'T': StartIncomingFile(sess, d, false); break;
+                    case 'j': StartIncomingFile(sess, d, true); break;
+                    case 'L': ListFolder(sess, d); break;
+                    case 'g': SendFiles(sess, d); break;
                     case 'U': WriteFileChunk(sess, d); break;
                     case 'Z': FinishIncomingFile(sess, d); break;
                     case 'X':
@@ -364,30 +369,50 @@ namespace RemoteDesk
 
         // ---- incoming file transfer (viewer -> this computer) ---------------------------
 
-        void StartIncomingFile(Session sess, byte[] d)
+        // 'T': dropped on the remote screen -> Desktop. 'j': from the file manager -> the
+        // folder it names ("folder\nname"), with a reply ('a') when it's saved.
+        void StartIncomingFile(Session sess, byte[] d, bool intoFolder)
         {
+            int fileId = Proto.Int(d, 0);
             try
             {
-                int fileId = Proto.Int(d, 0);
                 long size = Proto.LongAt(d, 4);
-                string name = Proto.Str(Proto.Sub(d, 12, d.Length - 12));
+                string name = Proto.Str(Proto.Sub(d, 12, d.Length - 12)), folder = SaveDir;
+                if (intoFolder)
+                {
+                    int nl = name.IndexOf('\n');
+                    if (nl < 0) throw new Exception("bad request");
+                    folder = name.Substring(0, nl);
+                    name = name.Substring(nl + 1);
+                }
                 name = SanitizeName(name);
                 if (size < 0 || size > 20L * 1024 * 1024 * 1024) throw new Exception("bad size");
 
-                Directory.CreateDirectory(SaveDir);
-                string finalPath = UniquePath(Path.Combine(SaveDir, name));
+                Directory.CreateDirectory(folder);
+                string finalPath = UniquePath(Path.Combine(folder, name));
                 FileRecv fr = new FileRecv
                 {
                     Stream = new FileStream(finalPath + ".part", FileMode.Create, FileAccess.Write),
                     TempPath = finalPath + ".part",
                     FinalPath = finalPath,
                     Name = name,
+                    Folder = folder,
+                    Ack = intoFolder,
                     Expected = size
                 };
                 lock (sess.Files) sess.Files[fileId] = fr;
                 SetStatus("Receiving " + name + " (" + FormatSize(size) + ")...");
             }
-            catch (Exception ex) { SetStatus("File transfer error: " + ex.Message); }
+            catch (Exception ex)
+            {
+                SetStatus("File transfer error: " + ex.Message);
+                if (intoFolder) Reply(sess, 'a', Proto.Cat(Proto.Ints(fileId, 0), Proto.Text(ex.Message)));
+            }
+        }
+
+        static void Reply(Session sess, char type, byte[] data)
+        {
+            try { sess.Ch.Send(type, data); } catch { }
         }
 
         void WriteFileChunk(Session sess, byte[] d)
@@ -419,13 +444,84 @@ namespace RemoteDesk
                 fr.Stream.Close();
                 if (fr.Written != fr.Expected) throw new Exception("size mismatch");
                 File.Move(fr.TempPath, fr.FinalPath);
-                SetStatus("Received " + fr.Name + " (" + FormatSize(fr.Written) + ") -> " + SaveDir);
+                SetStatus("Received " + fr.Name + " (" + FormatSize(fr.Written) + ") -> " + fr.Folder);
+                if (fr.Ack) Reply(sess, 'a', Proto.Cat(Proto.Ints(fileId, 1), Proto.Text(Path.GetFileName(fr.FinalPath))));
             }
             catch (Exception ex)
             {
                 SetStatus("File transfer error: " + ex.Message);
                 try { File.Delete(fr.TempPath); } catch { }
+                if (fr.Ack) Reply(sess, 'a', Proto.Cat(Proto.Ints(fileId, 0), Proto.Text(ex.Message)));
             }
+        }
+
+        // ---- file manager: browsing and downloads (this computer -> viewer) -------------
+        //   viewer -> host:  L reqId,path (list a folder; "" = drives and common folders)
+        //                    g reqId,path (send a file or a whole folder)
+        //   host -> viewer:  l reqId,listing | f reqId,size,name (file starts; name may include
+        //                    sub-folders) | d reqId,offset,bytes | e reqId (file done) |
+        //                    n reqId (request done) | x reqId,message (failed)
+
+        void ListFolder(Session sess, byte[] d)
+        {
+            int req = Proto.Int(d, 0);
+            string path = Proto.Str(Proto.Sub(d, 4, d.Length - 4));
+            Reply(sess, 'l', Proto.Cat(Proto.Ints(req), Proto.Text(FileListing.Describe(path))));
+        }
+
+        void SendFiles(Session sess, byte[] d)
+        {
+            int req = Proto.Int(d, 0);
+            string path = Proto.Str(Proto.Sub(d, 4, d.Length - 4));
+            Thread t = new Thread(delegate()
+            {
+                try
+                {
+                    if (Directory.Exists(path))
+                    {
+                        string parent = Path.GetDirectoryName(path.TrimEnd('\\'));
+                        if (parent == null) parent = path;
+                        foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                        {
+                            if (!sess.Active) return;
+                            SendOneFile(sess, req, file, file.Substring(parent.TrimEnd('\\').Length + 1));
+                        }
+                    }
+                    else SendOneFile(sess, req, path, Path.GetFileName(path));
+                    Reply(sess, 'n', Proto.Ints(req));
+                }
+                catch (Exception ex) { Reply(sess, 'x', Proto.Cat(Proto.Ints(req), Proto.Text(ex.Message))); }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        static void SendOneFile(Session sess, int req, string file, string name)
+        {
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                sess.Ch.Send('f', Proto.Cat(Proto.Ints(req), Proto.LongBytes(fs.Length), Proto.Text(name)));
+                byte[] buf = new byte[256 * 1024];
+                long off = 0;
+                int n;
+                while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+                {
+                    if (!sess.Active) throw new IOException("session ended");
+                    sess.Ch.Send('d', Proto.Cat(Proto.Ints(req), Proto.LongBytes(off), n == buf.Length ? buf : Proto.Sub(buf, 0, n)));
+                    off += n;
+                }
+            }
+            sess.Ch.Send('e', Proto.Ints(req));
+        }
+
+        // ---- clipboard (this computer -> viewer; the other direction is 'C' in InputLoop) --
+
+        // Sends text copied on this computer to the connected viewer, if there is one.
+        public void SendClipboard(string text)
+        {
+            Session s = session;
+            if (s == null || !s.Active || text == null || text.Length == 0 || text.Length > 500000) return;
+            try { s.Ch.Send('C', Proto.Text(text)); } catch { }
         }
 
         void AbortIncomingFile(Session sess, int fileId, FileRecv fr)
