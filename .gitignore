@@ -1,0 +1,9 @@
+# build output (rebuild with build.ps1)
+dist/
+
+# test artifacts written next to the exe
+selftest*.txt
+selftest*.png
+viewtest.txt
+viewer.png
+ui-*.png

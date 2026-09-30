@@ -1,0 +1,2 @@
+# files that run on the Linux relay server must keep Linux line endings
+server/* text eol=lf

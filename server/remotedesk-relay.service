@@ -1,0 +1,13 @@
+[Unit]
+Description=RemoteDesk relay server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/relay.py 7788
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
